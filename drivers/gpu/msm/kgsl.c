@@ -539,6 +539,52 @@ static void kgsl_mem_entry_detach_process(struct kgsl_mem_entry *entry)
 	entry->priv = NULL;
 }
 
+#ifdef CONFIG_QCOM_KGSL_CONTEXT_DEBUG
+static void kgsl_context_debug_info(struct kgsl_device *device)
+{
+       struct kgsl_context *context;
+       struct kgsl_process_private *p;
+       int next;
+       /*
+       * Keep an interval between consecutive logging to avoid
+       * flooding the kernel log
+       */
+       static DEFINE_RATELIMIT_STATE(_rs, 10 * HZ, 1);
+
+       if (!__ratelimit(&_rs))
+                return;
+
+       dev_info(device->dev, "KGSL active contexts:\n");
+       dev_info(device->dev, "pid      process         total    attached   detached\n");
+
+       mutex_lock(&kgsl_driver.process_mutex);
+       read_lock(&device->context_lock);
+
+       list_for_each_entry(p, &kgsl_driver.process_list, list) {
+                int total_contexts = 0, num_detached = 0;
+
+                idr_for_each_entry(&device->context_idr, context, next) {
+                        if (context->proc_priv == p) {
+                                 total_contexts++;
+                                 if (kgsl_context_detached(context))
+                                         num_detached++;
+                        }
+                }
+
+                dev_info(device->dev, "%-8u %-15.15s %-8d %-10d %-10d\n",
+                                 (int)(p->pid), p->comm, total_contexts,
+                                 total_contexts - num_detached, num_detached);
+       }
+
+       read_unlock(&device->context_lock);
+       mutex_unlock(&kgsl_driver.process_mutex);
+}
+#else
+static void kgsl_context_debug_info(struct kgsl_device *device)
+{
+}
+#endif
+
 /**
  * kgsl_context_dump() - dump information about a draw context
  * @device: KGSL device that owns the context
@@ -613,6 +659,7 @@ int kgsl_context_init(struct kgsl_device_private *dev_priv,
 			"Per process context limit reached for pid %u",
 			pid_nr(dev_priv->process_priv->pid));
 		spin_unlock(&proc_priv->ctxt_count_lock);
+		kgsl_context_debug_info(device);
 		return -ENOSPC;
 	}
 
@@ -632,10 +679,12 @@ int kgsl_context_init(struct kgsl_device_private *dev_priv,
 	}
 
 	if (id < 0) {
-		if (id == -ENOSPC)
+		if (id == -ENOSPC) {
 			KGSL_DRV_INFO(device,
 				"cannot have more than %zu contexts due to memstore limitation\n",
 				KGSL_MEMSTORE_MAX);
+			kgsl_context_debug_info(device);
+		}
 		atomic_dec(&proc_priv->ctxt_count);
 		return id;
 	}
@@ -2322,7 +2371,7 @@ static int check_vma(unsigned long hostptr, u64 size)
 	return true;
 }
 
-static int memdesc_sg_virt(struct kgsl_memdesc *memdesc, unsigned long useraddr)
+static int memdesc_sg_virt(struct kgsl_memdesc *memdesc)
 {
 	int ret = 0;
 	long npages = 0, i;
@@ -2345,13 +2394,14 @@ static int memdesc_sg_virt(struct kgsl_memdesc *memdesc, unsigned long useraddr)
 	}
 
 	down_read(&current->mm->mmap_sem);
-	if (!check_vma(useraddr, memdesc->size)) {
+	if (!check_vma(memdesc->useraddr, memdesc->size)) {
 		up_read(&current->mm->mmap_sem);
 		ret = -EFAULT;
 		goto out;
 	}
 
-	npages = get_user_pages(useraddr, sglen, write, pages, NULL);
+	npages = get_user_pages(memdesc->useraddr,
+				sglen, write, pages, NULL);
 	up_read(&current->mm->mmap_sem);
 
 	ret = (npages < 0) ? (int)npages : 0;
@@ -2403,12 +2453,7 @@ static int kgsl_setup_anon_useraddr(struct kgsl_pagetable *pagetable,
 		entry->memdesc.gpuaddr = (uint64_t) hostptr;
 	}
 
-	ret = memdesc_sg_virt(&entry->memdesc, hostptr);
-
-	if (ret && kgsl_memdesc_use_cpu_map(&entry->memdesc))
-		kgsl_mmu_put_gpuaddr(&entry->memdesc);
-
-	return ret;
+	return memdesc_sg_virt(&entry->memdesc);
 }
 
 #ifdef CONFIG_DMA_SHARED_BUFFER
